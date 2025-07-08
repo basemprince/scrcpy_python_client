@@ -1,0 +1,13 @@
+name: scrcpy-client
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - ffmpeg
+  - pkg-config
+  - pip
+  - pip:
+      - av==15.0.0
+      - numpy>=1.26.0
+      - pygame==2.6.0

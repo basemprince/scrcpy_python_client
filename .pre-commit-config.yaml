@@ -1,0 +1,123 @@
+default_language_version:
+  python: python3.12
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-ast
+      - id: check-builtin-literals
+      - id: check-case-conflict
+      - id: check-docstring-first
+      - id: check-executables-have-shebangs
+      - id: check-illegal-windows-names
+      - id: check-json
+      - id: check-merge-conflict
+        # args: [--assume-in-merge]
+      - id: check-shebang-scripts-are-executable
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-vcs-permalinks
+      - id: check-xml
+      - id: check-yaml
+        # args:
+        #   - --allow-multiple-documents
+        #   - --unsafe
+      - id: debug-statements
+      - id: destroyed-symlinks
+      - id: detect-aws-credentials
+        args:
+          # - --credentials-file CREDENTIALS_FILE
+          - --allow-missing-credentials
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: fix-byte-order-marker
+      - id: forbid-new-submodules
+      - id: forbid-submodules
+      - id: mixed-line-ending
+        args: [--fix=auto]
+      - id: name-tests-test
+        args:
+          # - --pytest
+          - --pytest-test-first
+      - id: no-commit-to-branch
+        args:
+          - --branch
+          - main
+          - --branch
+          - dev
+      - id: pretty-format-json
+        args:
+          - --autofix
+          - --indent
+          - "2"
+          - --no-sort-keys
+        exclude: '\.ipynb$'
+      - id: requirements-txt-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 24.10.0
+    hooks:
+      - id: black
+        language_version: python3.12
+        args: [--line-length=120]
+      - id: black-jupyter
+        language_version: python3.12
+        args: [--line-length=120]
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args:
+          - --profile=black
+          - --line-length=120
+
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.1.1
+    hooks:
+      - id: flake8
+        additional_dependencies: [flake8-bugbear]
+        args:
+          - --max-line-length=120
+          - --extend-select=B950
+          - --extend-ignore=E203,E501,E701
+
+  - repo: https://github.com/PyCQA/autoflake
+    rev: v2.3.1
+    hooks:
+      - id: autoflake
+        args:
+          - --in-place
+          - --remove-all-unused-imports
+          - --remove-unused-variables
+          - --ignore-init-module-imports
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - types-requests
+          - types-PyYAML
+          - types-toml
+          - types-setuptools
+          - types-six
+          - types-Pillow
+          - types-python-dateutil
+        args:
+          - --check-untyped-defs
+          - --ignore-missing-imports
+
+  - repo: https://github.com/PyCQA/pylint
+    rev: v3.3.1
+    hooks:
+      - id: pylint
+        args:
+          - --max-line-length=120 # Number of characters per line
+          - --max-args=6 # Number of max allowed arguments
+          # - --max-positional-arguments=3
+          - --disable=W0718 # Catching too general exception Exception (broad-exception-caught)
+          - --disable=E0401 # import-error
