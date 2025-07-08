@@ -11,3 +11,4 @@ dependencies:
       - av==15.0.0
       - numpy>=1.26.0
       - pygame==2.6.0
+      - pre-commit==3.2.0
