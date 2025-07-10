@@ -7,12 +7,21 @@ import struct
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import av
 import numpy as np
 import pygame
+
+from control import (
+    AMOTION_EVENT_ACTION_DOWN,
+    AMOTION_EVENT_ACTION_MOVE,
+    AMOTION_EVENT_ACTION_UP,
+    ANDROID_KEYCODES,
+    MOUSE_BUTTON_MAP,
+    Control,
+)
 
 CODECS = {
     0x68323634: "h264",
@@ -58,10 +67,11 @@ class ClientConfig:
     stay_awake: bool = True
     lock_screen_orientation: int = LOCK_SCREEN_ORIENTATION_UNLOCKED
     docker: bool = False
+    control: bool = True
 
 
 @dataclass
-class ClientState:
+class ClientState:  # pylint: disable=too-many-instance-attributes
     """Dynamic state during runtime."""
 
     proc: Optional[subprocess.Popen] = None
@@ -69,6 +79,10 @@ class ClientState:
     resolution: Optional[Tuple[int, int]] = None
     device_name: Optional[str] = None
     thread: Optional[threading.Thread] = None
+    video_sock: Optional[socket.socket] = None
+    control: Optional[Control] = None
+    log_thread: Optional[threading.Thread] = None
+    stop_event: threading.Event = field(default_factory=threading.Event)
 
 
 class Client:
@@ -85,6 +99,14 @@ class Client:
         self.state = ClientState()
         self.run()
 
+    def _log_server_output(self, pipe) -> None:
+        """Continuously print server output lines."""
+        try:
+            for line in iter(pipe.readline, b""):
+                print(line.decode(errors="ignore"), end="")
+        finally:
+            pipe.close()
+
     def _start_server(self) -> None:
         """Start the scrcpy server on the Android device."""
         server_file_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), self.config.server)
@@ -100,7 +122,7 @@ class Client:
             SERVER_VERSION,
             "tunnel_forward=true",
             "audio=false",
-            "control=false",
+            f"control={'true' if self.config.control else 'false'}",
             "cleanup=false",
         ]
         if self.config.max_width:
@@ -116,33 +138,87 @@ class Client:
         if self.config.lock_screen_orientation != LOCK_SCREEN_ORIENTATION_UNLOCKED:
             cmd.append(f"lock_screen_orientation={self.config.lock_screen_orientation}")
 
-        self.state.proc = subprocess.Popen(cmd)  # pylint: disable=consider-using-with
+        print("Starting server:", " ".join(cmd))
+        # pylint: disable=consider-using-with
+        self.state.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        if self.state.proc.stdout:
+            self.state.log_thread = threading.Thread(
+                target=self._log_server_output,
+                args=(self.state.proc.stdout,),
+                daemon=True,
+            )
+            self.state.log_thread.start()
 
     def _stop_server(self) -> None:
         """Stop the scrcpy server."""
+        if self.state.stop_event.is_set():
+            return
+        self.state.stop_event.set()
         if self.state.proc:
             self.state.proc.terminate()
             self.state.proc.wait()
-        subprocess.run(self.adb_cmd + ["forward", "--remove", f"tcp:{self.config.port}"], check=True)
+            self.state.proc = None
+        if self.state.log_thread:
+            self.state.log_thread.join(timeout=1)
+            self.state.log_thread = None
+        try:
+            subprocess.run(
+                self.adb_cmd + ["forward", "--remove", f"tcp:{self.config.port}"],
+                check=False,
+            )
+        except Exception:
+            pass
+        if self.state.video_sock:
+            try:
+                self.state.video_sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            self.state.video_sock.close()
+            self.state.video_sock = None
+        if self.state.control:
+            self.state.control.stop()
+            self.state.control = None
 
     def stop(self) -> None:
         """Stop the server and associated thread."""
         self._stop_server()
+        if self.state.thread:
+            self.state.thread.join()
+        if self.state.log_thread:
+            self.state.log_thread.join(timeout=1)
 
     def run(self) -> None:
         """Start the scrcpy client and video loop."""
         self._start_server()
         time.sleep(1)
-        self.state.thread = threading.Thread(target=self._video_loop, daemon=True)
+        print("Connecting to video socket...")
+        self.state.video_sock = socket.create_connection((self.config.host, self.config.port))
+        print("Video socket connected")
+        if self.config.control:
+            print("Connecting to control socket...")
+            control_sock = socket.create_connection((self.config.host, self.config.port))
+            print("Control socket connected")
+            self.state.control = Control(control_sock)
+            self.state.control.start()
+
+        self.state.thread = threading.Thread(target=self._video_loop, args=(self.state.video_sock,), daemon=True)
         self.state.thread.start()
 
     def _init_decoder(self, sock: socket.socket) -> Tuple[av.CodecContext, int, int]:
         """Initialize decoder and return decoder, width, and height."""
+        print("Initializing decoder...")
         _ = read_exact(sock, 1)
         self.state.device_name = read_exact(sock, 64).split(b"\0", 1)[0].decode()
         raw_codec = struct.unpack(">I", read_exact(sock, 4))[0]
         self.state.resolution = struct.unpack(">II", read_exact(sock, 8))
         width_, height_ = self.state.resolution
+        if self.state.control:
+            self.state.control.set_resolution(self.state.resolution)
         codec_name = CODECS.get(raw_codec)
         if not codec_name:
             raise RuntimeError(f"Unsupported codec id: {raw_codec:#x}")
@@ -150,37 +226,43 @@ class Client:
         decoder = av.CodecContext.create(codec_name, "r")
         return decoder, width_, height_
 
-    def _video_loop(self) -> None:
+    def _video_loop(self, sock: socket.socket) -> None:
         """Main loop to receive and decode video packets."""
         try:
-            with socket.create_connection((self.config.host, self.config.port)) as sock:
-                decoder, _, _ = self._init_decoder(sock)
-                config_data = b""
+            decoder, _, _ = self._init_decoder(sock)
+            config_data = b""
 
-                while True:
+            while not self.state.stop_event.is_set():
+                try:
                     header = read_exact(sock, HEADER_SIZE)
-                    pts_flags, size = struct.unpack(">QI", header)
+                except (OSError, EOFError):
+                    break
+                pts_flags, size = struct.unpack(">QI", header)
+                try:
                     packet_data = read_exact(sock, size)
+                except (OSError, EOFError):
+                    break
 
-                    if pts_flags & FLAG_CONFIG:
-                        config_data = packet_data
-                        continue
+                if pts_flags & FLAG_CONFIG:
+                    config_data = packet_data
+                    continue
 
-                    if config_data:
-                        packet_data = config_data + packet_data
-                        config_data = b""
+                if config_data:
+                    packet_data = config_data + packet_data
+                    config_data = b""
 
-                    packet = av.Packet(packet_data)
-                    packet.pts = pts_flags & PTS_MASK
-                    if pts_flags & FLAG_KEY_FRAME:
-                        try:
-                            packet.is_keyframe = True
-                        except AttributeError:
-                            pass
+                packet = av.Packet(packet_data)
+                packet.pts = pts_flags & PTS_MASK
+                if pts_flags & FLAG_KEY_FRAME:
+                    try:
+                        packet.is_keyframe = True
+                    except AttributeError:
+                        pass
 
-                    for decoded_frame in decoder.decode(packet):
-                        img = decoded_frame.to_ndarray(format="rgb24")
-                        self.state.last_frame = img
+                for decoded_frame in decoder.decode(packet):
+                    img = decoded_frame.to_ndarray(format="rgb24")
+                    self.state.last_frame = img
+                    print("Received frame", decoded_frame.pts)
 
         finally:
             self._stop_server()
@@ -215,6 +297,65 @@ if __name__ == "__main__":
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     raise KeyboardInterrupt
+                if event.type in (pygame.KEYDOWN, pygame.KEYUP):
+                    ACTION = AMOTION_EVENT_ACTION_DOWN if event.type == pygame.KEYDOWN else AMOTION_EVENT_ACTION_UP
+                    mods = pygame.key.get_mods()
+                    if (
+                        mods & (pygame.KMOD_LALT | pygame.KMOD_LMETA)
+                        and not (mods & pygame.KMOD_SHIFT)
+                        and not event.repeat
+                    ):
+                        if event.key == pygame.K_h:
+                            client.state.control.inject_keycode(3, ACTION)  # type: ignore[union-attr] # HOME
+                            continue
+                        if event.key in (pygame.K_b, pygame.K_BACKSPACE):
+                            client.state.control.back_or_screen_on(ACTION)  # type: ignore[union-attr]
+                            continue
+                        if event.key == pygame.K_s:
+                            client.state.control.inject_keycode(187, ACTION)  # type: ignore[union-attr] # APP_SWITCH
+                            continue
+                        if event.key == pygame.K_m:
+                            client.state.control.inject_keycode(82, ACTION)  # type: ignore[union-attr] # MENU
+                            continue
+                        if event.key == pygame.K_p:
+                            client.state.control.inject_keycode(26, ACTION)  # type: ignore[union-attr] # POWER
+                            continue
+                        if event.key == pygame.K_n:
+                            if mods & pygame.KMOD_SHIFT:
+                                client.state.control.collapse_panels()  # type: ignore[union-attr]
+                            elif event.type == pygame.KEYDOWN:
+                                client.state.control.expand_notification_panel()  # type: ignore[union-attr]
+                            continue
+
+                    keycode = ANDROID_KEYCODES.get(event.key)
+                    if keycode is not None and client.state.control:
+                        client.state.control.inject_keycode(keycode, ACTION)
+                if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
+                    button = MOUSE_BUTTON_MAP.get(event.button)
+                    if button is not None:
+                        down = event.type == pygame.MOUSEBUTTONDOWN
+                        if down:
+                            client.state.control.mouse_buttons |= button  # type: ignore[union-attr]
+                        else:
+                            client.state.control.mouse_buttons &= ~button  # type: ignore[union-attr]
+                        ACTION = AMOTION_EVENT_ACTION_DOWN if down else AMOTION_EVENT_ACTION_UP
+                        client.state.control.inject_touch(  # type: ignore[union-attr]
+                            ACTION,
+                            event.pos[0],
+                            event.pos[1],
+                            1.0 if down else 0.0,
+                            button if down else 0,
+                            client.state.control.mouse_buttons,  # type: ignore[union-attr]
+                        )
+                if event.type == pygame.MOUSEMOTION and client.state.control and client.state.control.mouse_buttons:
+                    client.state.control.inject_touch(
+                        AMOTION_EVENT_ACTION_MOVE,
+                        event.pos[0],
+                        event.pos[1],
+                        1.0,
+                        0,
+                        client.state.control.mouse_buttons,
+                    )
 
             if client.state.last_frame is not None:
                 current_frame = client.state.last_frame
